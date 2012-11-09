@@ -22,7 +22,7 @@ Dumping Puppet code here now. Format later.
 
 Client Setup
 ------------
-* for EL5, build/install newer OpenSSH RPM that supports remote key retrieval.
+* for EL5, build/install newer OpenSSH RPM that supports remote key retrieval. (included in openssh directory)
 * for EL6, ensure openssh-ldap RPM is installed (included in the distro)
 
 Include this in /etc/ssh/sshd_config:
