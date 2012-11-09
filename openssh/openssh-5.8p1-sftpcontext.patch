@@ -1,0 +1,14 @@
+diff -up openssh-5.8p1/session.c.sftpcontext openssh-5.8p1/session.c
+--- openssh-5.8p1/session.c.sftpcontext	2011-04-05 19:46:53.674654050 +0200
++++ openssh-5.8p1/session.c	2011-04-05 19:48:32.942658237 +0200
+@@ -1520,6 +1520,10 @@ do_setusercontext(struct passwd *pw)
+ 			free(chroot_path);
+ 		}
+ 
++#ifdef WITH_SELINUX
++		ssh_selinux_change_context("sshd_sftpd_t");
++#endif
++
+ #ifdef HAVE_LOGIN_CAP
+ 		if (setusercontext(lc, pw, pw->pw_uid, LOGIN_SETUSER) < 0) {
+ 			perror("unable to set user context (setuser)");

@@ -1,0 +1,17 @@
+Don't audit SSH_INVALID_USER twice.
+
+PRIVSEP(getpwnamallow()) a few lines above already did this.
+
+diff -ur openssh/auth2.c openssh-5.8p1/auth2.c
+--- openssh/auth2.c	2011-03-02 02:32:52.383773622 +0100
++++ openssh-5.8p1/auth2.c	2011-03-02 03:32:34.585110911 +0100
+@@ -250,9 +250,6 @@
+ 		} else {
+ 			logit("input_userauth_request: invalid user %s", user);
+ 			authctxt->pw = fakepw();
+-#ifdef SSH_AUDIT_EVENTS
+-			PRIVSEP(audit_event(SSH_INVALID_USER));
+-#endif
+ 		}
+ #ifdef USE_PAM
+ 		if (options.use_pam)

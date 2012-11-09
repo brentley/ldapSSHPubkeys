@@ -1,0 +1,353 @@
+diff -up openssh-5.8p1/audit-bsm.c.audit2 openssh-5.8p1/audit-bsm.c
+--- openssh-5.8p1/audit-bsm.c.audit2	2011-03-04 14:28:16.000000000 +0100
++++ openssh-5.8p1/audit-bsm.c	2011-03-04 14:28:17.000000000 +0100
+@@ -329,6 +329,12 @@ audit_session_close(struct logininfo *li
+ 	/* not implemented */
+ }
+ 
++int
++audit_keyusage(int host_user, const char *type, unsigned bits, char *fp, int rv)
++{
++	/* not implemented */
++}
++
+ void
+ audit_event(ssh_audit_event_t event)
+ {
+diff -up openssh-5.8p1/audit.c.audit2 openssh-5.8p1/audit.c
+--- openssh-5.8p1/audit.c.audit2	2011-03-04 14:28:16.000000000 +0100
++++ openssh-5.8p1/audit.c	2011-03-04 14:28:17.000000000 +0100
+@@ -36,6 +36,7 @@
+ #include "key.h"
+ #include "hostfile.h"
+ #include "auth.h"
++#include "xmalloc.h"
+ 
+ /*
+  * Care must be taken when using this since it WILL NOT be initialized when
+@@ -111,6 +112,22 @@ audit_event_lookup(ssh_audit_event_t ev)
+ 	return(event_lookup[i].name);
+ }
+ 
++void
++audit_key(int host_user, int *rv, const Key *key)
++{
++	char *fp;
++	const char *crypto_name;
++
++	fp = key_selected_fingerprint(key, SSH_FP_HEX);
++	if (key->type == KEY_RSA1)
++		crypto_name = "ssh-rsa1";
++	else
++		crypto_name = key_ssh_name(key);
++	if (audit_keyusage(host_user, crypto_name, key_size(key), fp, *rv) == 0)
++		*rv = 0;
++	xfree(fp);
++}
++
+ # ifndef CUSTOM_SSH_AUDIT_EVENTS
+ /*
+  * Null implementations of audit functions.
+@@ -209,5 +226,17 @@ audit_end_command(int handle, const char
+ 	    audit_username(), command);
+ }
+ 
++/*
++ * This will be called when user is successfully autherized by the RSA1/RSA/DSA key.
++ *
++ * Type is the key type, len is the key length(byte) and fp is the fingerprint of the key.
++ */
++int
++audit_keyusage(int host_user, const char *type, unsigned bits, char *fp, int rv)
++{
++	debug("audit %s key usage euid %d user %s key type %s key length %d fingerprint %s%s, result %d", 
++		host_user ? "pubkey" : "hostbased", geteuid(), audit_username(), type, bits,
++		key_fingerprint_prefix(), fp, rv);
++}
+ # endif  /* !defined CUSTOM_SSH_AUDIT_EVENTS */
+ #endif /* SSH_AUDIT_EVENTS */
+diff -up openssh-5.8p1/audit.h.audit2 openssh-5.8p1/audit.h
+--- openssh-5.8p1/audit.h.audit2	2011-03-04 14:28:16.000000000 +0100
++++ openssh-5.8p1/audit.h	2011-03-04 14:28:17.000000000 +0100
+@@ -28,6 +28,7 @@
+ # define _SSH_AUDIT_H
+ 
+ #include "loginrec.h"
++#include "key.h"
+ 
+ enum ssh_audit_event_type {
+ 	SSH_LOGIN_EXCEED_MAXTRIES,
+@@ -55,5 +56,7 @@ void	audit_session_close(struct logininf
+ int	audit_run_command(const char *);
+ void 	audit_end_command(int, const char *);
+ ssh_audit_event_t audit_classify_auth(const char *);
++int	audit_keyusage(int, const char *, unsigned, char *, int);
++void	audit_key(int, int *, const Key *);
+ 
+ #endif /* _SSH_AUDIT_H */
+diff -up openssh-5.8p1/audit-linux.c.audit2 openssh-5.8p1/audit-linux.c
+--- openssh-5.8p1/audit-linux.c.audit2	2011-03-04 14:28:16.000000000 +0100
++++ openssh-5.8p1/audit-linux.c	2011-03-04 14:28:17.000000000 +0100
+@@ -41,6 +41,8 @@
+ #include "servconf.h"
+ #include "canohost.h"
+ 
++#define AUDIT_LOG_SIZE 128
++
+ extern ServerOptions options;
+ extern Authctxt *the_authctxt;
+ extern u_int utmp_len;
+@@ -130,6 +132,37 @@ fatal_report:
+ 	}
+ }
+ 
++int
++audit_keyusage(int host_user, const char *type, unsigned bits, char *fp, int rv)
++{
++	char buf[AUDIT_LOG_SIZE];
++	int audit_fd, rc, saved_errno;
++
++	audit_fd = audit_open();
++	if (audit_fd < 0) {
++		if (errno == EINVAL || errno == EPROTONOSUPPORT ||
++					 errno == EAFNOSUPPORT)
++			return 1; /* No audit support in kernel */
++		else                                                                                                                                       
++			return 0; /* Must prevent login */
++	}
++	snprintf(buf, sizeof(buf), "%s_auth rport=%d", host_user ? "pubkey" : "hostbased", get_remote_port());
++	rc = audit_log_acct_message(audit_fd, AUDIT_USER_AUTH, NULL,
++		buf, audit_username(), -1, NULL, get_remote_ipaddr(), NULL, rv);
++	if ((rc < 0) && ((rc != -1) || (getuid() == 0)))
++		goto out;
++	snprintf(buf, sizeof(buf), "key algo=%s size=%d fp=%s%s rport=%d",
++			type, bits, key_fingerprint_prefix(), fp, get_remote_port());
++	rc = audit_log_acct_message(audit_fd, AUDIT_USER_AUTH, NULL,
++		buf, audit_username(), -1, NULL, get_remote_ipaddr(), NULL, rv);
++out:
++	saved_errno = errno;
++	audit_close(audit_fd);
++	errno = saved_errno;
++	/* do not report error if the error is EPERM and sshd is run as non root user */
++	return (rc >= 0) || ((rc == -EPERM) && (getuid() != 0));
++}
++
+ static int user_login_count = 0;
+ 
+ /* Below is the sshd audit API code */
+diff -up openssh-5.8p1/auth2-hostbased.c.audit2 openssh-5.8p1/auth2-hostbased.c
+--- openssh-5.8p1/auth2-hostbased.c.audit2	2011-03-04 14:28:16.000000000 +0100
++++ openssh-5.8p1/auth2-hostbased.c	2011-03-04 14:28:17.000000000 +0100
+@@ -119,7 +119,7 @@ userauth_hostbased(Authctxt *authctxt)
+ 	/* test for allowed key and correct signature */
+ 	authenticated = 0;
+ 	if (PRIVSEP(hostbased_key_allowed(authctxt->pw, cuser, chost, key)) &&
+-	    PRIVSEP(key_verify(key, sig, slen, buffer_ptr(&b),
++	    PRIVSEP(hostbased_key_verify(key, sig, slen, buffer_ptr(&b),
+ 			buffer_len(&b))) == 1)
+ 		authenticated = 1;
+ 
+@@ -136,6 +136,18 @@ done:
+ 	return authenticated;
+ }
+ 
++int
++hostbased_key_verify(const Key *key, const u_char *sig, u_int slen, const u_char *data, u_int datalen)
++{
++	int rv;
++
++	rv = key_verify(key, sig, slen, data, datalen);
++#ifdef SSH_AUDIT_EVENTS
++	audit_key(0, &rv, key);
++#endif
++	return rv;
++}
++
+ /* return 1 if given hostkey is allowed */
+ int
+ hostbased_key_allowed(struct passwd *pw, const char *cuser, char *chost,
+diff -up openssh-5.8p1/auth2-pubkey.c.audit2 openssh-5.8p1/auth2-pubkey.c
+--- openssh-5.8p1/auth2-pubkey.c.audit2	2011-03-04 14:28:16.000000000 +0100
++++ openssh-5.8p1/auth2-pubkey.c	2011-03-04 14:28:17.000000000 +0100
+@@ -140,7 +140,7 @@ userauth_pubkey(Authctxt *authctxt)
+ 		/* test for correct signature */
+ 		authenticated = 0;
+ 		if (PRIVSEP(user_key_allowed(authctxt->pw, key)) &&
+-		    PRIVSEP(key_verify(key, sig, slen, buffer_ptr(&b),
++		    PRIVSEP(user_key_verify(key, sig, slen, buffer_ptr(&b),
+ 		    buffer_len(&b))) == 1)
+ 			authenticated = 1;
+ 		buffer_free(&b);
+@@ -177,6 +177,18 @@ done:
+ 	return authenticated;
+ }
+ 
++int
++user_key_verify(const Key *key, const u_char *sig, u_int slen, const u_char *data, u_int datalen)
++{
++	int rv;
++
++	rv = key_verify(key, sig, slen, data, datalen);
++#ifdef SSH_AUDIT_EVENTS
++	audit_key(1, &rv, key);
++#endif
++	return rv;
++}
++
+ static int
+ match_principals_option(const char *principal_list, struct KeyCert *cert)
+ {
+diff -up openssh-5.8p1/auth.h.audit2 openssh-5.8p1/auth.h
+--- openssh-5.8p1/auth.h.audit2	2010-05-10 03:58:03.000000000 +0200
++++ openssh-5.8p1/auth.h	2011-03-04 14:28:17.000000000 +0100
+@@ -170,6 +170,7 @@ void	abandon_challenge_response(Authctxt
+ char	*authorized_keys_file(struct passwd *);
+ char	*authorized_keys_file2(struct passwd *);
+ char	*authorized_principals_file(struct passwd *);
++int	 user_key_verify(const Key *, const u_char *, u_int, const u_char *, u_int);
+ 
+ FILE	*auth_openkeyfile(const char *, struct passwd *, int);
+ FILE	*auth_openprincipals(const char *, struct passwd *, int);
+@@ -185,6 +186,7 @@ Key	*get_hostkey_public_by_type(int);
+ Key	*get_hostkey_private_by_type(int);
+ int	 get_hostkey_index(Key *);
+ int	 ssh1_session_key(BIGNUM *);
++int	 hostbased_key_verify(const Key *, const u_char *, u_int, const u_char *, u_int);
+ 
+ /* debug messages during authentication */
+ void	 auth_debug_add(const char *fmt,...) __attribute__((format(printf, 1, 2)));
+diff -up openssh-5.8p1/auth-rsa.c.audit2 openssh-5.8p1/auth-rsa.c
+--- openssh-5.8p1/auth-rsa.c.audit2	2011-03-04 14:28:16.000000000 +0100
++++ openssh-5.8p1/auth-rsa.c	2011-03-04 14:28:17.000000000 +0100
+@@ -92,7 +92,10 @@ auth_rsa_verify_response(Key *key, BIGNU
+ {
+ 	u_char buf[32], mdbuf[16];
+ 	MD5_CTX md;
+-	int len;
++	int len, rv;
++#ifdef SSH_AUDIT_EVENTS
++	char *fp;
++#endif
+ 
+ 	/* don't allow short keys */
+ 	if (BN_num_bits(key->rsa->n) < SSH_RSA_MINIMUM_MODULUS_SIZE) {
+@@ -113,12 +116,18 @@ auth_rsa_verify_response(Key *key, BIGNU
+ 	MD5_Final(mdbuf, &md);
+ 
+ 	/* Verify that the response is the original challenge. */
+-	if (timingsafe_bcmp(response, mdbuf, 16) != 0) {
+-		/* Wrong answer. */
+-		return (0);
++	rv = timingsafe_bcmp(response, mdbuf, 16) == 0;
++
++#ifdef SSH_AUDIT_EVENTS
++	fp = key_selected_fingerprint(key, SSH_FP_HEX);
++	if (audit_keyusage(1, "ssh-rsa1", RSA_size(key->rsa) * 8, fp, rv) == 0) {
++		debug("unsuccessful audit");
++		rv = 0;
+ 	}
+-	/* Correct answer. */
+-	return (1);
++	xfree(fp);
++#endif
++
++	return rv;
+ }
+ 
+ /*
+diff -up openssh-5.8p1/monitor.c.audit2 openssh-5.8p1/monitor.c
+--- openssh-5.8p1/monitor.c.audit2	2011-03-04 14:28:16.000000000 +0100
++++ openssh-5.8p1/monitor.c	2011-03-04 14:28:17.000000000 +0100
+@@ -1208,9 +1208,11 @@ mm_answer_keyverify(int sock, Buffer *m)
+ 	Key *key;
+ 	u_char *signature, *data, *blob;
+ 	u_int signaturelen, datalen, bloblen;
++	int type = 0;
+ 	int verified = 0;
+ 	int valid_data = 0;
+ 
++	type = buffer_get_int(m);
+ 	blob = buffer_get_string(m, &bloblen);
+ 	signature = buffer_get_string(m, &signaturelen);
+ 	data = buffer_get_string(m, &datalen);
+@@ -1218,6 +1220,8 @@ mm_answer_keyverify(int sock, Buffer *m)
+ 	if (hostbased_cuser == NULL || hostbased_chost == NULL ||
+ 	  !monitor_allowed_key(blob, bloblen))
+ 		fatal("%s: bad key, not previously allowed", __func__);
++	if (type != key_blobtype)
++		fatal("%s: bad key type", __func__);
+ 
+ 	key = key_from_blob(blob, bloblen);
+ 	if (key == NULL)
+@@ -1238,7 +1242,17 @@ mm_answer_keyverify(int sock, Buffer *m)
+ 	if (!valid_data)
+ 		fatal("%s: bad signature data blob", __func__);
+ 
+-	verified = key_verify(key, signature, signaturelen, data, datalen);
++	switch (key_blobtype) {
++	case MM_USERKEY:
++		verified = user_key_verify(key, signature, signaturelen, data, datalen);
++		break;
++	case MM_HOSTKEY:
++		verified = hostbased_key_verify(key, signature, signaturelen, data, datalen);
++		break;
++	default:
++		verified = 0;
++		break;
++	}
+ 	debug3("%s: key %p signature %s",
+ 	    __func__, key, (verified == 1) ? "verified" : "unverified");
+ 
+diff -up openssh-5.8p1/monitor_wrap.c.audit2 openssh-5.8p1/monitor_wrap.c
+--- openssh-5.8p1/monitor_wrap.c.audit2	2011-03-04 14:28:16.000000000 +0100
++++ openssh-5.8p1/monitor_wrap.c	2011-03-04 14:28:17.000000000 +0100
+@@ -393,7 +393,7 @@ mm_key_allowed(enum mm_keytype type, cha
+  */
+ 
+ int
+-mm_key_verify(Key *key, u_char *sig, u_int siglen, u_char *data, u_int datalen)
++mm_key_verify(enum mm_keytype type, Key *key, u_char *sig, u_int siglen, u_char *data, u_int datalen)
+ {
+ 	Buffer m;
+ 	u_char *blob;
+@@ -407,6 +407,7 @@ mm_key_verify(Key *key, u_char *sig, u_i
+ 		return (0);
+ 
+ 	buffer_init(&m);
++	buffer_put_int(&m, type);
+ 	buffer_put_string(&m, blob, len);
+ 	buffer_put_string(&m, sig, siglen);
+ 	buffer_put_string(&m, data, datalen);
+@@ -424,6 +425,19 @@ mm_key_verify(Key *key, u_char *sig, u_i
+ 	return (verified);
+ }
+ 
++int
++mm_hostbased_key_verify(Key *key, u_char *sig, u_int siglen, u_char *data, u_int datalen)
++{
++	return mm_key_verify(MM_HOSTKEY, key, sig, siglen, data, datalen);
++}
++
++int
++mm_user_key_verify(Key *key, u_char *sig, u_int siglen, u_char *data, u_int datalen)
++{
++	return mm_key_verify(MM_USERKEY, key, sig, siglen, data, datalen);
++}
++
++
+ /* Export key state after authentication */
+ Newkeys *
+ mm_newkeys_from_blob(u_char *blob, int blen)
+diff -up openssh-5.8p1/monitor_wrap.h.audit2 openssh-5.8p1/monitor_wrap.h
+--- openssh-5.8p1/monitor_wrap.h.audit2	2011-03-04 14:28:16.000000000 +0100
++++ openssh-5.8p1/monitor_wrap.h	2011-03-04 14:28:17.000000000 +0100
+@@ -48,7 +48,8 @@ int mm_key_allowed(enum mm_keytype, char
+ int mm_user_key_allowed(struct passwd *, Key *);
+ int mm_hostbased_key_allowed(struct passwd *, char *, char *, Key *);
+ int mm_auth_rhosts_rsa_key_allowed(struct passwd *, char *, char *, Key *);
+-int mm_key_verify(Key *, u_char *, u_int, u_char *, u_int);
++int mm_hostbased_key_verify(Key *, u_char *, u_int, u_char *, u_int);
++int mm_user_key_verify(Key *, u_char *, u_int, u_char *, u_int);
+ int mm_auth_rsa_key_allowed(struct passwd *, BIGNUM *, Key **);
+ int mm_auth_rsa_verify_response(Key *, BIGNUM *, u_char *);
+ BIGNUM *mm_auth_rsa_generate_challenge(Key *);

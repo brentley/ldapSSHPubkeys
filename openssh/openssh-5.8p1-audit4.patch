@@ -1,0 +1,636 @@
+diff -up openssh-5.8p1/audit-bsm.c.audit4 openssh-5.8p1/audit-bsm.c
+--- openssh-5.8p1/audit-bsm.c.audit4	2011-03-14 16:24:07.432855067 +0100
++++ openssh-5.8p1/audit-bsm.c	2011-03-14 16:24:08.345979587 +0100
+@@ -408,4 +408,10 @@ audit_kex_body(int ctos, char *enc, char
+ {
+ 	/* not implemented */
+ }
++
++void
++audit_session_key_free_body(int ctos, pid_t pid, uid_t uid)
++{
++	/* not implemented */
++}
+ #endif /* BSM */
+diff -up openssh-5.8p1/audit.c.audit4 openssh-5.8p1/audit.c
+--- openssh-5.8p1/audit.c.audit4	2011-03-14 16:24:07.489855036 +0100
++++ openssh-5.8p1/audit.c	2011-03-14 16:24:08.396854718 +0100
+@@ -143,6 +143,12 @@ audit_kex(int ctos, char *enc, char *mac
+ 	PRIVSEP(audit_kex_body(ctos, enc, mac, comp, getpid(), getuid()));
+ }
+ 
++void
++audit_session_key_free(int ctos)
++{
++	PRIVSEP(audit_session_key_free_body(ctos, getpid(), getuid()));
++}
++
+ # ifndef CUSTOM_SSH_AUDIT_EVENTS
+ /*
+  * Null implementations of audit functions.
+@@ -274,5 +280,15 @@ audit_kex_body(int ctos, char *enc, char
+ 		(unsigned)geteuid(), ctos, enc, mac, compress, (long)pid,
+ 	        (unsigned)uid);
+ }
++
++/*
++ * This will be called on succesfull session key discard
++ */
++void
++audit_session_key_free_body(int ctos, pid_t pid, uid_t uid)
++{
++	debug("audit session key discard euid %u direction %d from pid %ld uid %u",
++		(unsigned)geteuid(), ctos, (long)pid, (unsigned)uid);
++}
+ # endif  /* !defined CUSTOM_SSH_AUDIT_EVENTS */
+ #endif /* SSH_AUDIT_EVENTS */
+diff -up openssh-5.8p1/audit.h.audit4 openssh-5.8p1/audit.h
+--- openssh-5.8p1/audit.h.audit4	2011-03-14 16:24:07.539854526 +0100
++++ openssh-5.8p1/audit.h	2011-03-14 16:24:08.442854618 +0100
+@@ -62,5 +62,7 @@ void	audit_unsupported(int);
+ void	audit_kex(int, char *, char *, char *);
+ void	audit_unsupported_body(int);
+ void	audit_kex_body(int, char *, char *, char *, pid_t, uid_t);
++void	audit_session_key_free(int ctos);
++void	audit_session_key_free_body(int ctos, pid_t, uid_t);
+ 
+ #endif /* _SSH_AUDIT_H */
+diff -up openssh-5.8p1/audit-linux.c.audit4 openssh-5.8p1/audit-linux.c
+--- openssh-5.8p1/audit-linux.c.audit4	2011-03-14 16:24:07.593854867 +0100
++++ openssh-5.8p1/audit-linux.c	2011-03-14 16:26:58.133854996 +0100
+@@ -292,6 +292,8 @@ audit_unsupported_body(int what)
+ #endif
+ }
+ 
++const static char *direction[] = { "from-server", "from-client", "both" };
++
+ void
+ audit_kex_body(int ctos, char *enc, char *mac, char *compress, pid_t pid,
+ 	       uid_t uid)
+@@ -299,7 +301,6 @@ audit_kex_body(int ctos, char *enc, char
+ #ifdef AUDIT_CRYPTO_SESSION
+ 	char buf[AUDIT_LOG_SIZE];
+ 	int audit_fd, audit_ok;
+-	const static char *direction[] = { "from-server", "from-client", "both" };
+ 	Cipher *cipher = cipher_by_name(enc);
+ 
+ 	snprintf(buf, sizeof(buf), "op=start direction=%s cipher=%s ksize=%d spid=%jd suid=%jd rport=%d laddr=%s lport=%d ",
+@@ -323,4 +324,30 @@ audit_kex_body(int ctos, char *enc, char
+ #endif
+ }
+ 
++void
++audit_session_key_free_body(int ctos, pid_t pid, uid_t uid)
++{
++	char buf[AUDIT_LOG_SIZE];
++	int audit_fd, audit_ok;
++
++	snprintf(buf, sizeof(buf), "op=destroy kind=session fp=? direction=%s spid=%jd suid=%jd rport=%d laddr=%s lport=%d ",
++		 direction[ctos], (intmax_t)pid, (intmax_t)uid,
++		 get_remote_port(),
++		 get_local_ipaddr(packet_get_connection_in()),
++		 get_local_port());
++	audit_fd = audit_open();
++	if (audit_fd < 0) {
++		if (errno != EINVAL && errno != EPROTONOSUPPORT &&
++					 errno != EAFNOSUPPORT)
++			error("cannot open audit");
++		return;
++	}
++	audit_ok = audit_log_user_message(audit_fd, AUDIT_CRYPTO_KEY_USER,
++			buf, NULL, get_remote_ipaddr(), NULL, 1);
++	audit_close(audit_fd);
++	/* do not abort if the error is EPERM and sshd is run as non root user */
++	if ((audit_ok < 0) && ((audit_ok != -1) || (getuid() == 0)))
++		error("cannot write into audit");
++}
++
+ #endif /* USE_LINUX_AUDIT */
+diff -up openssh-5.8p1/auditstub.c.audit4 openssh-5.8p1/auditstub.c
+--- openssh-5.8p1/auditstub.c.audit4	2011-03-14 16:24:07.634855095 +0100
++++ openssh-5.8p1/auditstub.c	2011-03-14 16:24:08.553854657 +0100
+@@ -27,6 +27,8 @@
+  * Red Hat author: Jan F. Chadima <jchadima@redhat.com>
+  */
+ 
++#include <sys/types.h>
++
+ void
+ audit_unsupported(int n)
+ {
+@@ -37,3 +39,12 @@ audit_kex(int ctos, char *enc, char *mac
+ {
+ }
+ 
++void
++audit_session_key_free(int ctos)
++{
++}
++
++void
++audit_session_key_free_body(int ctos, pid_t pid, uid_t uid)
++{
++}
+diff -up openssh-5.8p1/kex.c.audit4 openssh-5.8p1/kex.c
+--- openssh-5.8p1/kex.c.audit4	2011-03-14 16:24:07.791854867 +0100
++++ openssh-5.8p1/kex.c	2011-03-14 16:24:08.602854638 +0100
+@@ -624,3 +624,34 @@ dump_digest(char *msg, u_char *digest, i
+ 	fprintf(stderr, "\n");
+ }
+ #endif
++
++static void
++enc_destroy(Enc *enc)
++{
++	if (enc == NULL)
++		return;
++
++	if (enc->key) {
++		memset(enc->key, 0, enc->key_len);
++		xfree(enc->key);
++	}
++
++	if (enc->iv) {
++		memset(enc->iv,  0, enc->block_size);
++		xfree(enc->iv);
++	}
++
++	memset(enc, 0, sizeof(*enc));
++}
++
++void
++newkeys_destroy(Newkeys *newkeys)
++{
++	if (newkeys == NULL)
++		return;
++
++	enc_destroy(&newkeys->enc);
++	mac_destroy(&newkeys->mac);
++	memset(&newkeys->comp, 0, sizeof(newkeys->comp));
++}
++
+diff -up openssh-5.8p1/kex.h.audit4 openssh-5.8p1/kex.h
+--- openssh-5.8p1/kex.h.audit4	2010-09-24 14:11:14.000000000 +0200
++++ openssh-5.8p1/kex.h	2011-03-14 16:24:08.650854566 +0100
+@@ -156,6 +156,8 @@ void	 kexgex_server(Kex *);
+ void	 kexecdh_client(Kex *);
+ void	 kexecdh_server(Kex *);
+ 
++void	newkeys_destroy(Newkeys *newkeys);
++
+ void
+ kex_dh_hash(char *, char *, char *, int, char *, int, u_char *, int,
+     BIGNUM *, BIGNUM *, BIGNUM *, u_char **, u_int *);
+diff -up openssh-5.8p1/mac.c.audit4 openssh-5.8p1/mac.c
+--- openssh-5.8p1/mac.c.audit4	2008-06-13 02:58:50.000000000 +0200
++++ openssh-5.8p1/mac.c	2011-03-14 16:24:08.697854630 +0100
+@@ -162,6 +162,20 @@ mac_clear(Mac *mac)
+ 	mac->umac_ctx = NULL;
+ }
+ 
++void
++mac_destroy(Mac *mac)
++{
++	if (mac == NULL)
++		return;
++
++	if (mac->key) {
++		memset(mac->key, 0, mac->key_len);
++		xfree(mac->key);
++	}
++
++	memset(mac, 0, sizeof(*mac));
++}
++
+ /* XXX copied from ciphers_valid */
+ #define	MAC_SEP	","
+ int
+diff -up openssh-5.8p1/mac.h.audit4 openssh-5.8p1/mac.h
+--- openssh-5.8p1/mac.h.audit4	2007-06-11 06:01:42.000000000 +0200
++++ openssh-5.8p1/mac.h	2011-03-14 16:24:08.747854620 +0100
+@@ -28,3 +28,4 @@ int	 mac_setup(Mac *, char *);
+ int	 mac_init(Mac *);
+ u_char	*mac_compute(Mac *, u_int32_t, u_char *, int);
+ void	 mac_clear(Mac *);
++void	 mac_destroy(Mac *);
+diff -up openssh-5.8p1/monitor.c.audit4 openssh-5.8p1/monitor.c
+--- openssh-5.8p1/monitor.c.audit4	2011-03-14 16:24:07.900854565 +0100
++++ openssh-5.8p1/monitor.c	2011-03-14 16:24:08.810854693 +0100
+@@ -181,6 +181,7 @@ int mm_answer_audit_command(int, Buffer 
+ int mm_answer_audit_end_command(int, Buffer *);
+ int mm_answer_audit_unsupported_body(int, Buffer *);
+ int mm_answer_audit_kex_body(int, Buffer *);
++int mm_answer_audit_session_key_free_body(int, Buffer *);
+ #endif
+ 
+ static Authctxt *authctxt;
+@@ -231,6 +232,7 @@ struct mon_table mon_dispatch_proto20[] 
+     {MONITOR_REQ_AUDIT_EVENT, MON_PERMIT, mm_answer_audit_event},
+     {MONITOR_REQ_AUDIT_UNSUPPORTED, MON_PERMIT, mm_answer_audit_unsupported_body},
+     {MONITOR_REQ_AUDIT_KEX, MON_PERMIT, mm_answer_audit_kex_body},
++    {MONITOR_REQ_AUDIT_SESSION_KEY_FREE, MON_PERMIT, mm_answer_audit_session_key_free_body},
+ #endif
+ #ifdef BSD_AUTH
+     {MONITOR_REQ_BSDAUTHQUERY, MON_ISAUTH, mm_answer_bsdauthquery},
+@@ -270,6 +272,7 @@ struct mon_table mon_dispatch_postauth20
+     {MONITOR_REQ_AUDIT_END_COMMAND, MON_PERMIT, mm_answer_audit_end_command},
+     {MONITOR_REQ_AUDIT_UNSUPPORTED, MON_PERMIT, mm_answer_audit_unsupported_body},
+     {MONITOR_REQ_AUDIT_KEX, MON_PERMIT, mm_answer_audit_kex_body},
++    {MONITOR_REQ_AUDIT_SESSION_KEY_FREE, MON_PERMIT, mm_answer_audit_session_key_free_body},
+ #endif
+     {0, 0, NULL}
+ };
+@@ -303,6 +306,7 @@ struct mon_table mon_dispatch_proto15[] 
+     {MONITOR_REQ_AUDIT_EVENT, MON_PERMIT, mm_answer_audit_event},
+     {MONITOR_REQ_AUDIT_UNSUPPORTED, MON_PERMIT, mm_answer_audit_unsupported_body},
+     {MONITOR_REQ_AUDIT_KEX, MON_PERMIT, mm_answer_audit_kex_body},
++    {MONITOR_REQ_AUDIT_SESSION_KEY_FREE, MON_PERMIT, mm_answer_audit_session_key_free_body},
+ #endif
+     {0, 0, NULL}
+ };
+@@ -317,6 +321,7 @@ struct mon_table mon_dispatch_postauth15
+     {MONITOR_REQ_AUDIT_END_COMMAND, MON_PERMIT, mm_answer_audit_end_command},
+     {MONITOR_REQ_AUDIT_UNSUPPORTED, MON_PERMIT, mm_answer_audit_unsupported_body},
+     {MONITOR_REQ_AUDIT_KEX, MON_PERMIT, mm_answer_audit_kex_body},
++    {MONITOR_REQ_AUDIT_SESSION_KEY_FREE, MON_PERMIT, mm_answer_audit_session_key_free_body},
+ #endif
+     {0, 0, NULL}
+ };
+@@ -1812,11 +1817,13 @@ mm_get_keystate(struct monitor *pmonitor
+ 
+ 	blob = buffer_get_string(&m, &bloblen);
+ 	current_keys[MODE_OUT] = mm_newkeys_from_blob(blob, bloblen);
++	memset(blob, 0, bloblen);
+ 	xfree(blob);
+ 
+ 	debug3("%s: Waiting for second key", __func__);
+ 	blob = buffer_get_string(&m, &bloblen);
+ 	current_keys[MODE_IN] = mm_newkeys_from_blob(blob, bloblen);
++	memset(blob, 0, bloblen);
+ 	xfree(blob);
+ 
+ 	/* Now get sequence numbers for the packets */
+@@ -1862,6 +1869,16 @@ mm_get_keystate(struct monitor *pmonitor
+ 	}
+ 
+ 	buffer_free(&m);
++
++#ifdef SSH_AUDIT_EVENTS
++	if (compat20) {
++		buffer_init(&m);
++		mm_request_receive_expect(pmonitor->m_sendfd,
++					  MONITOR_REQ_AUDIT_SESSION_KEY_FREE, &m);
++		mm_answer_audit_session_key_free_body(pmonitor->m_sendfd, &m);
++		buffer_free(&m);
++	}
++#endif
+ }
+ 
+ 
+@@ -2303,4 +2320,22 @@ mm_answer_audit_kex_body(int sock, Buffe
+ 	return 0;
+ }
+ 
++int
++mm_answer_audit_session_key_free_body(int sock, Buffer *m)
++{
++	int ctos;
++	pid_t pid;
++	uid_t uid;
++
++	ctos = buffer_get_int(m);
++	pid = buffer_get_int64(m);
++	uid = buffer_get_int64(m);
++
++	audit_session_key_free_body(ctos, pid, uid);
++
++	buffer_clear(m);
++
++	mm_request_send(sock, MONITOR_ANS_AUDIT_SESSION_KEY_FREE, m);
++	return 0;
++}
+ #endif /* SSH_AUDIT_EVENTS */
+diff -up openssh-5.8p1/monitor.h.audit4 openssh-5.8p1/monitor.h
+--- openssh-5.8p1/monitor.h.audit4	2011-03-14 16:24:07.956854553 +0100
++++ openssh-5.8p1/monitor.h	2011-03-14 16:24:08.857854697 +0100
+@@ -69,6 +69,7 @@ enum monitor_reqtype {
+ 	MONITOR_REQ_JPAKE_CHECK_CONFIRM, MONITOR_ANS_JPAKE_CHECK_CONFIRM,
+ 	MONITOR_REQ_AUDIT_UNSUPPORTED, MONITOR_ANS_AUDIT_UNSUPPORTED,
+ 	MONITOR_REQ_AUDIT_KEX, MONITOR_ANS_AUDIT_KEX,
++	MONITOR_REQ_AUDIT_SESSION_KEY_FREE, MONITOR_ANS_AUDIT_SESSION_KEY_FREE,
+ };
+ 
+ struct mm_master;
+diff -up openssh-5.8p1/monitor_wrap.c.audit4 openssh-5.8p1/monitor_wrap.c
+--- openssh-5.8p1/monitor_wrap.c.audit4	2011-03-14 16:24:08.013854544 +0100
++++ openssh-5.8p1/monitor_wrap.c	2011-03-14 16:24:08.917854588 +0100
+@@ -615,12 +615,14 @@ mm_send_keystate(struct monitor *monitor
+ 		fatal("%s: conversion of newkeys failed", __func__);
+ 
+ 	buffer_put_string(&m, blob, bloblen);
++	memset(blob, 0, bloblen);
+ 	xfree(blob);
+ 
+ 	if (!mm_newkeys_to_blob(MODE_IN, &blob, &bloblen))
+ 		fatal("%s: conversion of newkeys failed", __func__);
+ 
+ 	buffer_put_string(&m, blob, bloblen);
++	memset(blob, 0, bloblen);
+ 	xfree(blob);
+ 
+ 	packet_get_state(MODE_OUT, &seqnr, &blocks, &packets, &bytes);
+@@ -1484,4 +1486,19 @@ mm_audit_kex_body(int ctos, char *cipher
+ 
+ 	buffer_free(&m);
+ }
++
++void
++mm_audit_session_key_free_body(int ctos, pid_t pid, uid_t uid)
++{
++	Buffer m;
++
++	buffer_init(&m);
++	buffer_put_int(&m, ctos);
++	buffer_put_int64(&m, pid);
++	buffer_put_int64(&m, uid);
++	mm_request_send(pmonitor->m_recvfd, MONITOR_REQ_AUDIT_SESSION_KEY_FREE, &m);
++	mm_request_receive_expect(pmonitor->m_recvfd, MONITOR_ANS_AUDIT_SESSION_KEY_FREE,
++				  &m);
++	buffer_free(&m);
++}
+ #endif /* SSH_AUDIT_EVENTS */
+diff -up openssh-5.8p1/monitor_wrap.h.audit4 openssh-5.8p1/monitor_wrap.h
+--- openssh-5.8p1/monitor_wrap.h.audit4	2011-03-14 16:24:08.061854654 +0100
++++ openssh-5.8p1/monitor_wrap.h	2011-03-14 16:24:08.962855020 +0100
+@@ -78,6 +78,7 @@ int mm_audit_run_command(const char *);
+ void mm_audit_end_command(int, const char *);
+ void mm_audit_unsupported_body(int);
+ void mm_audit_kex_body(int, char *, char *, char *, pid_t, uid_t);
++void mm_audit_session_key_free_body(int, pid_t, uid_t);
+ #endif
+ 
+ struct Session;
+diff -up openssh-5.8p1/packet.c.audit4 openssh-5.8p1/packet.c
+--- openssh-5.8p1/packet.c.audit4	2010-11-24 00:46:37.000000000 +0100
++++ openssh-5.8p1/packet.c	2011-03-14 16:24:09.027854309 +0100
+@@ -60,6 +60,7 @@
+ #include <signal.h>
+ 
+ #include "xmalloc.h"
++#include "audit.h"
+ #include "buffer.h"
+ #include "packet.h"
+ #include "crc32.h"
+@@ -472,6 +473,13 @@ packet_get_connection_out(void)
+ 	return active_state->connection_out;
+ }
+ 
++static int
++packet_state_has_keys (const struct session_state *state)
++{
++	return state != NULL &&
++		(state->newkeys[MODE_IN] != NULL || state->newkeys[MODE_OUT] != NULL);
++}
++
+ /* Closes the connection and clears and frees internal data structures. */
+ 
+ void
+@@ -480,13 +488,6 @@ packet_close(void)
+ 	if (!active_state->initialized)
+ 		return;
+ 	active_state->initialized = 0;
+-	if (active_state->connection_in == active_state->connection_out) {
+-		shutdown(active_state->connection_out, SHUT_RDWR);
+-		close(active_state->connection_out);
+-	} else {
+-		close(active_state->connection_in);
+-		close(active_state->connection_out);
+-	}
+ 	buffer_free(&active_state->input);
+ 	buffer_free(&active_state->output);
+ 	buffer_free(&active_state->outgoing_packet);
+@@ -495,8 +496,18 @@ packet_close(void)
+ 		buffer_free(&active_state->compression_buffer);
+ 		buffer_compress_uninit();
+ 	}
+-	cipher_cleanup(&active_state->send_context);
+-	cipher_cleanup(&active_state->receive_context);
++	if (packet_state_has_keys(active_state)) {
++		cipher_cleanup(&active_state->send_context);
++		cipher_cleanup(&active_state->receive_context);
++		audit_session_key_free(2);
++	}
++	if (active_state->connection_in == active_state->connection_out) {
++		shutdown(active_state->connection_out, SHUT_RDWR);
++		close(active_state->connection_out);
++	} else {
++		close(active_state->connection_in);
++		close(active_state->connection_out);
++	}
+ }
+ 
+ /* Sets remote side protocol flags. */
+@@ -731,6 +742,23 @@ packet_send1(void)
+ 	 */
+ }
+ 
++static void
++newkeys_destroy_and_free(Newkeys *newkeys)
++{
++	if (newkeys == NULL)
++		return;
++
++	xfree(newkeys->enc.name);
++
++	mac_clear(&newkeys->mac);
++	xfree(newkeys->mac.name);
++
++	xfree(newkeys->comp.name);
++
++	newkeys_destroy(newkeys);
++	xfree(newkeys);
++}
++
+ void
+ set_newkeys(int mode)
+ {
+@@ -756,18 +784,9 @@ set_newkeys(int mode)
+ 	}
+ 	if (active_state->newkeys[mode] != NULL) {
+ 		debug("set_newkeys: rekeying");
++		audit_session_key_free(mode);
+ 		cipher_cleanup(cc);
+-		enc  = &active_state->newkeys[mode]->enc;
+-		mac  = &active_state->newkeys[mode]->mac;
+-		comp = &active_state->newkeys[mode]->comp;
+-		mac_clear(mac);
+-		xfree(enc->name);
+-		xfree(enc->iv);
+-		xfree(enc->key);
+-		xfree(mac->name);
+-		xfree(mac->key);
+-		xfree(comp->name);
+-		xfree(active_state->newkeys[mode]);
++		newkeys_destroy_and_free(active_state->newkeys[mode]);
+ 	}
+ 	active_state->newkeys[mode] = kex_get_newkeys(mode);
+ 	if (active_state->newkeys[mode] == NULL)
+@@ -1912,6 +1931,47 @@ packet_get_newkeys(int mode)
+ 	return (void *)active_state->newkeys[mode];
+ }
+ 
++static void
++packet_destroy_state(struct session_state *state)
++{
++	if (state == NULL)
++		return;
++
++	cipher_cleanup(&state->receive_context);
++	cipher_cleanup(&state->send_context);
++
++	buffer_free(&state->input);
++	buffer_free(&state->output);
++	buffer_free(&state->outgoing_packet);
++	buffer_free(&state->incoming_packet);
++	buffer_free(&state->compression_buffer);
++	newkeys_destroy_and_free(state->newkeys[MODE_IN]);
++	state->newkeys[MODE_IN] = NULL;
++	newkeys_destroy_and_free(state->newkeys[MODE_OUT]);
++	state->newkeys[MODE_OUT] = NULL;
++	mac_destroy(state->packet_discard_mac);
++//	TAILQ_HEAD(, packet) outgoing;
++//	memset(state, 0, sizeof(state));
++}
++
++void
++packet_destroy_all(int audit_it, int privsep)
++{
++	if (audit_it)
++		audit_it = packet_state_has_keys (active_state) ||
++			packet_state_has_keys (backup_state);
++	packet_destroy_state(active_state);
++	packet_destroy_state(backup_state);
++	if (audit_it) {
++#ifdef SSH_AUDIT_EVENTS
++		if (privsep)
++			audit_session_key_free(2);
++		else
++			audit_session_key_free_body(2, getpid(), getuid());
++#endif
++	}
++}
++
+ /*
+  * Save the state for the real connection, and use a separate state when
+  * resuming a suspended connection.
+@@ -1919,18 +1979,12 @@ packet_get_newkeys(int mode)
+ void
+ packet_backup_state(void)
+ {
+-	struct session_state *tmp;
+-
+ 	close(active_state->connection_in);
+ 	active_state->connection_in = -1;
+ 	close(active_state->connection_out);
+ 	active_state->connection_out = -1;
+-	if (backup_state)
+-		tmp = backup_state;
+-	else
+-		tmp = alloc_session_state();
+ 	backup_state = active_state;
+-	active_state = tmp;
++	active_state = alloc_session_state();
+ }
+ 
+ /*
+@@ -1947,9 +2001,7 @@ packet_restore_state(void)
+ 	backup_state = active_state;
+ 	active_state = tmp;
+ 	active_state->connection_in = backup_state->connection_in;
+-	backup_state->connection_in = -1;
+ 	active_state->connection_out = backup_state->connection_out;
+-	backup_state->connection_out = -1;
+ 	len = buffer_len(&backup_state->input);
+ 	if (len > 0) {
+ 		buf = buffer_ptr(&backup_state->input);
+@@ -1957,4 +2009,10 @@ packet_restore_state(void)
+ 		buffer_clear(&backup_state->input);
+ 		add_recv_bytes(len);
+ 	}
++	backup_state->connection_in = -1;
++	backup_state->connection_out = -1;
++	packet_destroy_state(backup_state);
++	xfree(backup_state);
++	backup_state = NULL;
+ }
++
+diff -up openssh-5.8p1/packet.h.audit4 openssh-5.8p1/packet.h
+--- openssh-5.8p1/packet.h.audit4	2010-11-20 05:19:38.000000000 +0100
++++ openssh-5.8p1/packet.h	2011-03-14 16:24:09.080979550 +0100
+@@ -125,4 +125,5 @@ void	 packet_restore_state(void);
+ void	*packet_get_input(void);
+ void	*packet_get_output(void);
+ 
++void	 packet_destroy_all(int, int);
+ #endif				/* PACKET_H */
+diff -up openssh-5.8p1/session.c.audit4 openssh-5.8p1/session.c
+--- openssh-5.8p1/session.c.audit4	2011-03-14 16:24:06.386922297 +0100
++++ openssh-5.8p1/session.c	2011-03-14 16:24:09.143048206 +0100
+@@ -1627,6 +1627,9 @@ do_child(Session *s, const char *command
+ 
+ 	/* remove hostkey from the child's memory */
+ 	destroy_sensitive_data();
++	/* Don't audit this - both us and the parent would be talking to the
++	   monitor over a single socket, with no synchronization. */
++	packet_destroy_all(0, 1);
+ 
+ 	/* Force a password change */
+ 	if (s->authctxt->force_pwchange) {
+diff -up openssh-5.8p1/sshd.c.audit4 openssh-5.8p1/sshd.c
+--- openssh-5.8p1/sshd.c.audit4	2011-03-14 16:24:08.127854626 +0100
++++ openssh-5.8p1/sshd.c	2011-03-14 16:24:09.229855281 +0100
+@@ -663,6 +663,8 @@ privsep_preauth(Authctxt *authctxt)
+ 	return (0);
+ }
+ 
++extern Newkeys *current_keys[];
++
+ static void
+ privsep_postauth(Authctxt *authctxt)
+ {
+@@ -688,6 +690,10 @@ privsep_postauth(Authctxt *authctxt)
+ 		verbose("User child is on pid %ld", (long)pmonitor->m_pid);
+ 		close(pmonitor->m_recvfd);
+ 		buffer_clear(&loginmsg);
++ 		newkeys_destroy(current_keys[MODE_OUT]);
++		newkeys_destroy(current_keys[MODE_IN]);
++		audit_session_key_free_body(2, getpid(), getuid());
++		packet_destroy_all(0, 0);
+ 		monitor_child_postauth(pmonitor);
+ 
+ 		/* NEVERREACHED */
+@@ -1974,6 +1980,7 @@ main(int ac, char **av)
+ 	 */
+ 	if (use_privsep) {
+ 		mm_send_keystate(pmonitor);
++		packet_destroy_all(1, 1);
+ 		exit(0);
+ 	}
+ 
+@@ -2026,6 +2033,8 @@ main(int ac, char **av)
+ 	do_authenticated(authctxt);
+ 
+ 	/* The connection has been terminated. */
++	packet_destroy_all(1, 1);
++
+ 	packet_get_state(MODE_IN, NULL, NULL, NULL, &ibytes);
+ 	packet_get_state(MODE_OUT, NULL, NULL, NULL, &obytes);
+ 	verbose("Transferred: sent %llu, received %llu bytes",
+@@ -2345,6 +2354,7 @@ cleanup_exit(int i)
+ {
+ 	if (the_authctxt)
+ 		do_cleanup(the_authctxt);
++	packet_destroy_all(1, is_privsep_child);
+ #ifdef SSH_AUDIT_EVENTS
+ 	/* done after do_cleanup so it can cancel the PAM auth 'thread' */
+ 	if ((the_authctxt == NULL || !the_authctxt->authenticated) &&

@@ -1,0 +1,521 @@
+diff -up openssh-5.8p1/audit-bsm.c.audit3 openssh-5.8p1/audit-bsm.c
+--- openssh-5.8p1/audit-bsm.c.audit3	2011-03-02 10:04:35.000000000 +0100
++++ openssh-5.8p1/audit-bsm.c	2011-03-02 10:04:36.000000000 +0100
+@@ -396,4 +396,16 @@ audit_event(ssh_audit_event_t event)
+ 		debug("%s: unhandled event %d", __func__, event);
+ 	}
+ }
++
++void
++audit_unsupported_body(int what)
++{
++	/* not implemented */
++}
++
++void
++audit_kex_body(int ctos, char *enc, char *mac, char *compress, pid_t pid, uid_t uid)
++{
++	/* not implemented */
++}
+ #endif /* BSM */
+diff -up openssh-5.8p1/audit.c.audit3 openssh-5.8p1/audit.c
+--- openssh-5.8p1/audit.c.audit3	2011-03-02 10:04:35.000000000 +0100
++++ openssh-5.8p1/audit.c	2011-03-02 10:04:36.000000000 +0100
+@@ -28,6 +28,7 @@
+ 
+ #include <stdarg.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ #ifdef SSH_AUDIT_EVENTS
+ 
+@@ -36,6 +37,8 @@
+ #include "key.h"
+ #include "hostfile.h"
+ #include "auth.h"
++#include "ssh-gss.h"
++#include "monitor_wrap.h"
+ #include "xmalloc.h"
+ 
+ /*
+@@ -128,6 +131,18 @@ audit_key(int host_user, int *rv, const 
+ 	xfree(fp);
+ }
+ 
++void
++audit_unsupported(int what)
++{
++	PRIVSEP(audit_unsupported_body(what));
++}
++
++void
++audit_kex(int ctos, char *enc, char *mac, char *comp)
++{
++	PRIVSEP(audit_kex_body(ctos, enc, mac, comp, getpid(), getuid()));
++}
++
+ # ifndef CUSTOM_SSH_AUDIT_EVENTS
+ /*
+  * Null implementations of audit functions.
+@@ -238,5 +253,26 @@ audit_keyusage(int host_user, const char
+ 		host_user ? "pubkey" : "hostbased", geteuid(), audit_username(), type, bits,
+ 		key_fingerprint_prefix(), fp, rv);
+ }
++
++/*
++ * This will be called when the protocol negotiation fails.
++ */
++void
++audit_unsupported_body(int what)
++{
++	debug("audit unsupported protocol euid %d type %d", geteuid(), what);
++}
++
++/*
++ * This will be called on succesfull protocol negotiation.
++ */
++void
++audit_kex_body(int ctos, char *enc, char *mac, char *compress, pid_t pid,
++	       uid_t uid)
++{
++	debug("audit protocol negotiation euid %d direction %d cipher %s mac %s compresion %s from pid %ld uid %u",
++		(unsigned)geteuid(), ctos, enc, mac, compress, (long)pid,
++	        (unsigned)uid);
++}
+ # endif  /* !defined CUSTOM_SSH_AUDIT_EVENTS */
+ #endif /* SSH_AUDIT_EVENTS */
+diff -up openssh-5.8p1/audit.h.audit3 openssh-5.8p1/audit.h
+--- openssh-5.8p1/audit.h.audit3	2011-03-02 10:04:36.000000000 +0100
++++ openssh-5.8p1/audit.h	2011-03-02 10:04:36.000000000 +0100
+@@ -58,5 +58,9 @@ void 	audit_end_command(int, const char 
+ ssh_audit_event_t audit_classify_auth(const char *);
+ int	audit_keyusage(int, const char *, unsigned, char *, int);
+ void	audit_key(int, int *, const Key *);
++void	audit_unsupported(int);
++void	audit_kex(int, char *, char *, char *);
++void	audit_unsupported_body(int);
++void	audit_kex_body(int, char *, char *, char *, pid_t, uid_t);
+ 
+ #endif /* _SSH_AUDIT_H */
+diff -up openssh-5.8p1/audit-linux.c.audit3 openssh-5.8p1/audit-linux.c
+--- openssh-5.8p1/audit-linux.c.audit3	2011-03-02 10:04:36.000000000 +0100
++++ openssh-5.8p1/audit-linux.c	2011-03-02 10:04:36.000000000 +0100
+@@ -40,6 +40,8 @@
+ #include "auth.h"
+ #include "servconf.h"
+ #include "canohost.h"
++#include "packet.h"
++#include "cipher.h"
+ 
+ #define AUDIT_LOG_SIZE 128
+ 
+@@ -269,4 +271,56 @@ audit_event(ssh_audit_event_t event)
+ 	}
+ }
+ 
++void
++audit_unsupported_body(int what)
++{
++#ifdef AUDIT_CRYPTO_SESSION
++	char buf[AUDIT_LOG_SIZE];
++	const static char *name[] = { "cipher", "mac", "comp" };
++	int audit_fd;
++
++	snprintf(buf, sizeof(buf), "op=unsupported-%s direction=? cipher=? ksize=? rport=%d laddr=%s lport=%d ",
++		name[what], get_remote_port(), get_local_ipaddr(packet_get_connection_in()),
++		get_local_port());
++	audit_fd = audit_open();
++	if (audit_fd < 0)
++		/* no problem, the next instruction will be fatal() */
++		return;
++	audit_log_user_message(audit_fd, AUDIT_CRYPTO_SESSION,
++			buf, NULL, get_remote_ipaddr(), NULL, 0);
++	audit_close(audit_fd);
++#endif
++}
++
++void
++audit_kex_body(int ctos, char *enc, char *mac, char *compress, pid_t pid,
++	       uid_t uid)
++{
++#ifdef AUDIT_CRYPTO_SESSION
++	char buf[AUDIT_LOG_SIZE];
++	int audit_fd, audit_ok;
++	const static char *direction[] = { "from-server", "from-client", "both" };
++	Cipher *cipher = cipher_by_name(enc);
++
++	snprintf(buf, sizeof(buf), "op=start direction=%s cipher=%s ksize=%d spid=%jd suid=%jd rport=%d laddr=%s lport=%d ",
++		direction[ctos], enc, cipher ? 8 * cipher->key_len : 0,
++		(intmax_t)pid, (intmax_t)uid,
++		get_remote_port(), get_local_ipaddr(packet_get_connection_in()), get_local_port());
++	audit_fd = audit_open();
++	if (audit_fd < 0) {
++		if (errno == EINVAL || errno == EPROTONOSUPPORT ||
++					 errno == EAFNOSUPPORT)
++			return; /* No audit support in kernel */
++		else                                                                                                                                       
++			fatal("cannot open audit"); /* Must prevent login */
++	}
++	audit_ok = audit_log_user_message(audit_fd, AUDIT_CRYPTO_SESSION,
++			buf, NULL, get_remote_ipaddr(), NULL, 1);
++	audit_close(audit_fd);
++	/* do not abort if the error is EPERM and sshd is run as non root user */
++	if ((audit_ok < 0) && ((audit_ok != -1) || (getuid() == 0)))
++		fatal("cannot write into audit"); /* Must prevent login */
++#endif
++}
++
+ #endif /* USE_LINUX_AUDIT */
+diff -up openssh-5.8p1/auditstub.c.audit3 openssh-5.8p1/auditstub.c
+--- openssh-5.8p1/auditstub.c.audit3	2011-03-02 10:04:36.000000000 +0100
++++ openssh-5.8p1/auditstub.c	2011-03-02 10:04:36.000000000 +0100
+@@ -0,0 +1,39 @@
++/* $Id: auditstub.c,v 1.1 jfch Exp $ */
++
++/*
++ * Copyright 2010 Red Hat, Inc.  All rights reserved.
++ * Use is subject to license terms.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
++ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * Red Hat author: Jan F. Chadima <jchadima@redhat.com>
++ */
++
++void
++audit_unsupported(int n)
++{
++}
++
++void
++audit_kex(int ctos, char *enc, char *mac, char *comp)
++{
++}
++
+diff -up openssh-5.8p1/cipher.c.audit3 openssh-5.8p1/cipher.c
+--- openssh-5.8p1/cipher.c.audit3	2011-02-09 15:24:23.000000000 +0100
++++ openssh-5.8p1/cipher.c	2011-03-02 10:04:36.000000000 +0100
+@@ -59,15 +59,7 @@ extern void ssh1_3des_iv(EVP_CIPHER_CTX 
+ extern const EVP_CIPHER *evp_aes_128_ctr(void);
+ extern void ssh_aes_ctr_iv(EVP_CIPHER_CTX *, int, u_char *, u_int);
+ 
+-struct Cipher {
+-	char	*name;
+-	int	number;		/* for ssh1 only */
+-	u_int	block_size;
+-	u_int	key_len;
+-	u_int	discard_len;
+-	u_int	cbc_mode;
+-	const EVP_CIPHER	*(*evptype)(void);
+-} ciphers[] = {
++struct Cipher ciphers[] = {
+ 	{ "none",		SSH_CIPHER_NONE, 8, 0, 0, 0, EVP_enc_null },
+ 	{ "des",		SSH_CIPHER_DES, 8, 8, 0, 1, EVP_des_cbc },
+ 	{ "3des",		SSH_CIPHER_3DES, 8, 16, 0, 1, evp_ssh1_3des },
+diff -up openssh-5.8p1/cipher.h.audit3 openssh-5.8p1/cipher.h
+--- openssh-5.8p1/cipher.h.audit3	2009-01-28 06:38:41.000000000 +0100
++++ openssh-5.8p1/cipher.h	2011-03-02 10:04:36.000000000 +0100
+@@ -61,7 +61,16 @@
+ typedef struct Cipher Cipher;
+ typedef struct CipherContext CipherContext;
+ 
+-struct Cipher;
++struct Cipher {
++	char	*name;
++	int	number;		/* for ssh1 only */
++	u_int	block_size;
++	u_int	key_len;
++	u_int	discard_len;
++	u_int	cbc_mode;
++	const EVP_CIPHER	*(*evptype)(void);
++};
++
+ struct CipherContext {
+ 	int	plaintext;
+ 	EVP_CIPHER_CTX evp;
+diff -up openssh-5.8p1/kex.c.audit3 openssh-5.8p1/kex.c
+--- openssh-5.8p1/kex.c.audit3	2010-09-24 14:11:14.000000000 +0200
++++ openssh-5.8p1/kex.c	2011-03-02 10:04:36.000000000 +0100
+@@ -49,6 +49,7 @@
+ #include "dispatch.h"
+ #include "monitor.h"
+ #include "roaming.h"
++#include "audit.h"
+ 
+ #if OPENSSL_VERSION_NUMBER >= 0x00907000L
+ # if defined(HAVE_EVP_SHA256)
+@@ -286,9 +287,13 @@ static void
+ choose_enc(Enc *enc, char *client, char *server)
+ {
+ 	char *name = match_list(client, server, NULL);
+-	if (name == NULL)
++	if (name == NULL) {
++#ifdef SSH_AUDIT_EVENTS
++		audit_unsupported(0);
++#endif
+ 		fatal("no matching cipher found: client %s server %s",
+ 		    client, server);
++	}
+ 	if ((enc->cipher = cipher_by_name(name)) == NULL)
+ 		fatal("matching cipher is not supported: %s", name);
+ 	enc->name = name;
+@@ -303,9 +308,13 @@ static void
+ choose_mac(Mac *mac, char *client, char *server)
+ {
+ 	char *name = match_list(client, server, NULL);
+-	if (name == NULL)
++	if (name == NULL) {
++#ifdef SSH_AUDIT_EVENTS
++		audit_unsupported(1);
++#endif
+ 		fatal("no matching mac found: client %s server %s",
+ 		    client, server);
++	}
+ 	if (mac_setup(mac, name) < 0)
+ 		fatal("unsupported mac %s", name);
+ 	/* truncate the key */
+@@ -320,8 +329,12 @@ static void
+ choose_comp(Comp *comp, char *client, char *server)
+ {
+ 	char *name = match_list(client, server, NULL);
+-	if (name == NULL)
++	if (name == NULL) {
++#ifdef SSH_AUDIT_EVENTS
++		audit_unsupported(2);
++#endif
+ 		fatal("no matching comp found: client %s server %s", client, server);
++	}
+ 	if (strcmp(name, "zlib@openssh.com") == 0) {
+ 		comp->type = COMP_DELAYED;
+ 	} else if (strcmp(name, "zlib") == 0) {
+@@ -446,6 +459,9 @@ kex_choose_conf(Kex *kex)
+ 		    newkeys->enc.name,
+ 		    newkeys->mac.name,
+ 		    newkeys->comp.name);
++#ifdef SSH_AUDIT_EVENTS
++		audit_kex(ctos, newkeys->enc.name, newkeys->mac.name, newkeys->comp.name);
++#endif
+ 	}
+ 	choose_kex(kex, cprop[PROPOSAL_KEX_ALGS], sprop[PROPOSAL_KEX_ALGS]);
+ 	choose_hostkeyalg(kex, cprop[PROPOSAL_SERVER_HOST_KEY_ALGS],
+diff -up openssh-5.8p1/Makefile.in.audit3 openssh-5.8p1/Makefile.in
+--- openssh-5.8p1/Makefile.in.audit3	2011-02-04 01:42:13.000000000 +0100
++++ openssh-5.8p1/Makefile.in	2011-03-02 10:04:37.000000000 +0100
+@@ -76,7 +76,7 @@ LIBSSH_OBJS=acss.o authfd.o authfile.o b
+ 	monitor_fdpass.o rijndael.o ssh-dss.o ssh-ecdsa.o ssh-rsa.o dh.o \
+ 	kexdh.o kexgex.o kexdhc.o kexgexc.o bufec.o kexecdh.o kexecdhc.o \
+ 	msg.o progressmeter.o dns.o entropy.o gss-genr.o umac.o jpake.o \
+-	schnorr.o ssh-pkcs11.o
++	schnorr.o ssh-pkcs11.o auditstub.o
+ 
+ SSHOBJS= ssh.o readconf.o clientloop.o sshtty.o \
+ 	sshconnect.o sshconnect1.o sshconnect2.o mux.o \
+diff -up openssh-5.8p1/monitor.c.audit3 openssh-5.8p1/monitor.c
+--- openssh-5.8p1/monitor.c.audit3	2011-03-02 10:04:36.000000000 +0100
++++ openssh-5.8p1/monitor.c	2011-03-02 10:04:37.000000000 +0100
+@@ -89,6 +89,7 @@
+ #include "ssh2.h"
+ #include "jpake.h"
+ #include "roaming.h"
++#include "audit.h"
+ 
+ #ifdef GSSAPI
+ static Gssctxt *gsscontext = NULL;
+@@ -178,6 +179,8 @@ int mm_answer_gss_checkmic(int, Buffer *
+ int mm_answer_audit_event(int, Buffer *);
+ int mm_answer_audit_command(int, Buffer *);
+ int mm_answer_audit_end_command(int, Buffer *);
++int mm_answer_audit_unsupported_body(int, Buffer *);
++int mm_answer_audit_kex_body(int, Buffer *);
+ #endif
+ 
+ static Authctxt *authctxt;
+@@ -226,6 +229,8 @@ struct mon_table mon_dispatch_proto20[] 
+ #endif
+ #ifdef SSH_AUDIT_EVENTS
+     {MONITOR_REQ_AUDIT_EVENT, MON_PERMIT, mm_answer_audit_event},
++    {MONITOR_REQ_AUDIT_UNSUPPORTED, MON_PERMIT, mm_answer_audit_unsupported_body},
++    {MONITOR_REQ_AUDIT_KEX, MON_PERMIT, mm_answer_audit_kex_body},
+ #endif
+ #ifdef BSD_AUTH
+     {MONITOR_REQ_BSDAUTHQUERY, MON_ISAUTH, mm_answer_bsdauthquery},
+@@ -263,6 +268,8 @@ struct mon_table mon_dispatch_postauth20
+     {MONITOR_REQ_AUDIT_EVENT, MON_PERMIT, mm_answer_audit_event},
+     {MONITOR_REQ_AUDIT_COMMAND, MON_PERMIT, mm_answer_audit_command},
+     {MONITOR_REQ_AUDIT_END_COMMAND, MON_PERMIT, mm_answer_audit_end_command},
++    {MONITOR_REQ_AUDIT_UNSUPPORTED, MON_PERMIT, mm_answer_audit_unsupported_body},
++    {MONITOR_REQ_AUDIT_KEX, MON_PERMIT, mm_answer_audit_kex_body},
+ #endif
+     {0, 0, NULL}
+ };
+@@ -294,6 +301,8 @@ struct mon_table mon_dispatch_proto15[] 
+ #endif
+ #ifdef SSH_AUDIT_EVENTS
+     {MONITOR_REQ_AUDIT_EVENT, MON_PERMIT, mm_answer_audit_event},
++    {MONITOR_REQ_AUDIT_UNSUPPORTED, MON_PERMIT, mm_answer_audit_unsupported_body},
++    {MONITOR_REQ_AUDIT_KEX, MON_PERMIT, mm_answer_audit_kex_body},
+ #endif
+     {0, 0, NULL}
+ };
+@@ -306,6 +315,8 @@ struct mon_table mon_dispatch_postauth15
+     {MONITOR_REQ_AUDIT_EVENT, MON_PERMIT, mm_answer_audit_event},
+     {MONITOR_REQ_AUDIT_COMMAND, MON_PERMIT|MON_ONCE, mm_answer_audit_command},
+     {MONITOR_REQ_AUDIT_END_COMMAND, MON_PERMIT, mm_answer_audit_end_command},
++    {MONITOR_REQ_AUDIT_UNSUPPORTED, MON_PERMIT, mm_answer_audit_unsupported_body},
++    {MONITOR_REQ_AUDIT_KEX, MON_PERMIT, mm_answer_audit_kex_body},
+ #endif
+     {0, 0, NULL}
+ };
+@@ -2252,3 +2263,44 @@ mm_answer_jpake_check_confirm(int sock, 
+ }
+ 
+ #endif /* JPAKE */
++
++#ifdef SSH_AUDIT_EVENTS
++int
++mm_answer_audit_unsupported_body(int sock, Buffer *m)
++{
++	int what;
++
++	what = buffer_get_int(m);
++
++	audit_unsupported_body(what);
++
++	buffer_clear(m);
++
++	mm_request_send(sock, MONITOR_ANS_AUDIT_UNSUPPORTED, m);
++	return 0;
++}
++
++int
++mm_answer_audit_kex_body(int sock, Buffer *m)
++{
++	int ctos, len;
++	char *cipher, *mac, *compress;
++	pid_t pid;
++	uid_t uid;
++
++	ctos = buffer_get_int(m);
++	cipher = buffer_get_string(m, &len);
++	mac = buffer_get_string(m, &len);
++	compress = buffer_get_string(m, &len);
++	pid = buffer_get_int64(m);
++	uid = buffer_get_int64(m);
++
++	audit_kex_body(ctos, cipher, mac, compress, pid, uid);
++
++	buffer_clear(m);
++
++	mm_request_send(sock, MONITOR_ANS_AUDIT_KEX, m);
++	return 0;
++}
++
++#endif /* SSH_AUDIT_EVENTS */
+diff -up openssh-5.8p1/monitor.h.audit3 openssh-5.8p1/monitor.h
+--- openssh-5.8p1/monitor.h.audit3	2011-03-02 10:04:35.000000000 +0100
++++ openssh-5.8p1/monitor.h	2011-03-02 10:04:37.000000000 +0100
+@@ -67,6 +67,8 @@ enum monitor_reqtype {
+ 	MONITOR_REQ_JPAKE_STEP2, MONITOR_ANS_JPAKE_STEP2,
+ 	MONITOR_REQ_JPAKE_KEY_CONFIRM, MONITOR_ANS_JPAKE_KEY_CONFIRM,
+ 	MONITOR_REQ_JPAKE_CHECK_CONFIRM, MONITOR_ANS_JPAKE_CHECK_CONFIRM,
++	MONITOR_REQ_AUDIT_UNSUPPORTED, MONITOR_ANS_AUDIT_UNSUPPORTED,
++	MONITOR_REQ_AUDIT_KEX, MONITOR_ANS_AUDIT_KEX,
+ };
+ 
+ struct mm_master;
+diff -up openssh-5.8p1/monitor_wrap.c.audit3 openssh-5.8p1/monitor_wrap.c
+--- openssh-5.8p1/monitor_wrap.c.audit3	2011-03-02 10:04:36.000000000 +0100
++++ openssh-5.8p1/monitor_wrap.c	2011-03-02 10:04:37.000000000 +0100
+@@ -1447,3 +1447,41 @@ mm_jpake_check_confirm(const BIGNUM *k,
+ 	return success;
+ }
+ #endif /* JPAKE */
++
++#ifdef SSH_AUDIT_EVENTS
++void
++mm_audit_unsupported_body(int what)
++{
++	Buffer m;
++
++	buffer_init(&m);
++	buffer_put_int(&m, what);
++
++	mm_request_send(pmonitor->m_recvfd, MONITOR_REQ_AUDIT_UNSUPPORTED, &m);
++	mm_request_receive_expect(pmonitor->m_recvfd, MONITOR_ANS_AUDIT_UNSUPPORTED,
++				  &m);
++
++	buffer_free(&m);
++}
++
++void
++mm_audit_kex_body(int ctos, char *cipher, char *mac, char *compress, pid_t pid,
++		  uid_t uid)
++{
++	Buffer m;
++
++	buffer_init(&m);
++	buffer_put_int(&m, ctos);
++	buffer_put_cstring(&m, cipher);
++	buffer_put_cstring(&m, mac);
++	buffer_put_cstring(&m, compress);
++	buffer_put_int64(&m, pid);
++	buffer_put_int64(&m, uid);
++
++	mm_request_send(pmonitor->m_recvfd, MONITOR_REQ_AUDIT_KEX, &m);
++	mm_request_receive_expect(pmonitor->m_recvfd, MONITOR_ANS_AUDIT_KEX,
++				  &m);
++
++	buffer_free(&m);
++}
++#endif /* SSH_AUDIT_EVENTS */
+diff -up openssh-5.8p1/monitor_wrap.h.audit3 openssh-5.8p1/monitor_wrap.h
+--- openssh-5.8p1/monitor_wrap.h.audit3	2011-03-02 10:04:36.000000000 +0100
++++ openssh-5.8p1/monitor_wrap.h	2011-03-02 10:05:36.000000000 +0100
+@@ -76,6 +76,8 @@ void mm_sshpam_free_ctx(void *);
+ void mm_audit_event(ssh_audit_event_t);
+ int mm_audit_run_command(const char *);
+ void mm_audit_end_command(int, const char *);
++void mm_audit_unsupported_body(int);
++void mm_audit_kex_body(int, char *, char *, char *, pid_t, uid_t);
+ #endif
+ 
+ struct Session;
+diff -up openssh-5.8p1/sshd.c.audit3 openssh-5.8p1/sshd.c
+--- openssh-5.8p1/sshd.c.audit3	2011-03-02 10:04:35.000000000 +0100
++++ openssh-5.8p1/sshd.c	2011-03-02 10:04:37.000000000 +0100
+@@ -118,6 +118,7 @@
+ #endif
+ #include "monitor_wrap.h"
+ #include "roaming.h"
++#include "audit.h"
+ #include "version.h"
+ 
+ #ifdef LIBWRAP
+@@ -2182,6 +2183,10 @@ do_ssh1_kex(void)
+ 		if (cookie[i] != packet_get_char())
+ 			packet_disconnect("IP Spoofing check bytes do not match.");
+ 
++#ifdef SSH_AUDIT_EVENTS
++	audit_kex(2, cipher_name(cipher_type), "crc", "none");
++#endif
++
+ 	debug("Encryption type: %.200s", cipher_name(cipher_type));
+ 
+ 	/* Get the encrypted integer. */

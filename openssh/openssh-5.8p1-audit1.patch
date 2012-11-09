@@ -1,0 +1,641 @@
+diff -up openssh-5.8p1/audit-bsm.c.audit1 openssh-5.8p1/audit-bsm.c
+--- openssh-5.8p1/audit-bsm.c.audit1	2011-01-17 11:15:29.000000000 +0100
++++ openssh-5.8p1/audit-bsm.c	2011-03-04 14:16:25.000000000 +0100
+@@ -298,10 +298,23 @@ audit_connection_from(const char *host, 
+ #endif
+ }
+ 
+-void
++int
+ audit_run_command(const char *command)
+ {
+ 	/* not implemented */
++	return 0;
++}
++
++void
++audit_end_command(int handle, const char *command)
++{
++	/* not implemented */
++}
++
++void
++audit_count_session_open(void)
++{
++	/* not necessary */
+ }
+ 
+ void
+diff -up openssh-5.8p1/audit.c.audit1 openssh-5.8p1/audit.c
+--- openssh-5.8p1/audit.c.audit1	2011-01-17 11:15:30.000000000 +0100
++++ openssh-5.8p1/audit.c	2011-03-04 14:16:25.000000000 +0100
+@@ -140,6 +140,17 @@ audit_event(ssh_audit_event_t event)
+ }
+ 
+ /*
++ * Called when a child process has called, or will soon call,
++ * audit_session_open.
++ */
++void
++audit_count_session_open(void)
++{
++	debug("audit count session open euid %d user %s", geteuid(),
++	      audit_username());
++}
++
++/*
+  * Called when a user session is started.  Argument is the tty allocated to
+  * the session, or NULL if no tty was allocated.
+  *
+@@ -174,13 +185,29 @@ audit_session_close(struct logininfo *li
+ /*
+  * This will be called when a user runs a non-interactive command.  Note that
+  * it may be called multiple times for a single connection since SSH2 allows
+- * multiple sessions within a single connection.
++ * multiple sessions within a single connection.  Returns a "handle" for
++ * audit_end_command.
+  */
+-void
++int
+ audit_run_command(const char *command)
+ {
+ 	debug("audit run command euid %d user %s command '%.200s'", geteuid(),
+ 	    audit_username(), command);
++	return 0;
++}
++
++/*
++ * This will be called when the non-interactive command finishes.  Note that
++ * it may be called multiple times for a single connection since SSH2 allows
++ * multiple sessions within a single connection.  "handle" should come from
++ * the corresponding audit_run_command.
++ */
++void
++audit_end_command(int handle, const char *command)
++{
++	debug("audit end nopty exec  euid %d user %s command '%.200s'", geteuid(),
++	    audit_username(), command);
+ }
++
+ # endif  /* !defined CUSTOM_SSH_AUDIT_EVENTS */
+ #endif /* SSH_AUDIT_EVENTS */
+diff -up openssh-5.8p1/audit.h.audit1 openssh-5.8p1/audit.h
+--- openssh-5.8p1/audit.h.audit1	2011-01-17 11:15:30.000000000 +0100
++++ openssh-5.8p1/audit.h	2011-03-04 14:16:25.000000000 +0100
+@@ -49,9 +49,11 @@ typedef enum ssh_audit_event_type ssh_au
+ 
+ void	audit_connection_from(const char *, int);
+ void	audit_event(ssh_audit_event_t);
++void	audit_count_session_open(void);
+ void	audit_session_open(struct logininfo *);
+ void	audit_session_close(struct logininfo *);
+-void	audit_run_command(const char *);
++int	audit_run_command(const char *);
++void 	audit_end_command(int, const char *);
+ ssh_audit_event_t audit_classify_auth(const char *);
+ 
+ #endif /* _SSH_AUDIT_H */
+diff -up openssh-5.8p1/audit-linux.c.audit1 openssh-5.8p1/audit-linux.c
+--- openssh-5.8p1/audit-linux.c.audit1	2011-01-17 11:15:30.000000000 +0100
++++ openssh-5.8p1/audit-linux.c	2011-03-04 14:16:25.000000000 +0100
+@@ -35,13 +35,20 @@
+ 
+ #include "log.h"
+ #include "audit.h"
++#include "key.h"
++#include "hostfile.h"
++#include "auth.h"
++#include "servconf.h"
+ #include "canohost.h"
+ 
++extern ServerOptions options;
++extern Authctxt *the_authctxt;
++extern u_int utmp_len;
+ const char* audit_username(void);
+ 
+-int
+-linux_audit_record_event(int uid, const char *username,
+-    const char *hostname, const char *ip, const char *ttyn, int success)
++static void
++linux_audit_user_logxxx(int uid, const char *username,
++    const char *hostname, const char *ip, const char *ttyn, int success, int event)
+ {
+ 	int audit_fd, rc, saved_errno;
+ 
+@@ -49,11 +56,11 @@ linux_audit_record_event(int uid, const 
+ 	if (audit_fd < 0) {
+ 		if (errno == EINVAL || errno == EPROTONOSUPPORT ||
+ 		    errno == EAFNOSUPPORT)
+-			return 1; /* No audit support in kernel */
++			return; /* No audit support in kernel */
+ 		else
+-			return 0; /* Must prevent login */
++			goto fatal_report; /* Must prevent login */
+ 	}
+-	rc = audit_log_acct_message(audit_fd, AUDIT_USER_LOGIN,
++	rc = audit_log_acct_message(audit_fd, event,
+ 	    NULL, "login", username ? username : "(unknown)",
+ 	    username == NULL ? uid : -1, hostname, ip, ttyn, success);
+ 	saved_errno = errno;
+@@ -65,35 +72,119 @@ linux_audit_record_event(int uid, const 
+ 	if ((rc == -EPERM) && (geteuid() != 0))
+ 		rc = 0;
+ 	errno = saved_errno;
+-	return (rc >= 0);
++	if (rc < 0) {
++fatal_report:
++		fatal("linux_audit_write_entry failed: %s", strerror(errno));
++	}
++}
++
++static void
++linux_audit_user_auth(int uid, const char *username,
++    const char *hostname, const char *ip, const char *ttyn, int success, int event)
++{
++	int audit_fd, rc, saved_errno;
++	static const char *event_name[] = {
++		"maxtries exceeded",
++		"root denied",
++		"success",
++		"none",
++		"password",
++		"challenge-response",
++		"pubkey",
++		"hostbased",
++		"gssapi",
++		"invalid user",
++		"nologin",
++		"connection closed",
++		"connection abandoned",
++		"unknown"
++	};
++
++	audit_fd = audit_open();
++	if (audit_fd < 0) {
++		if (errno == EINVAL || errno == EPROTONOSUPPORT ||
++		    errno == EAFNOSUPPORT)
++			return; /* No audit support in kernel */
++		else
++			goto fatal_report; /* Must prevent login */
++	}
++	
++	if ((event < 0) || (event > SSH_AUDIT_UNKNOWN))
++		event = SSH_AUDIT_UNKNOWN;
++
++	rc = audit_log_acct_message(audit_fd, AUDIT_USER_AUTH,
++	    NULL, event_name[event], username ? username : "(unknown)",
++	    username == NULL ? uid : -1, hostname, ip, ttyn, success);
++	saved_errno = errno;
++	close(audit_fd);
++	/*
++	 * Do not report error if the error is EPERM and sshd is run as non
++	 * root user.
++	 */
++	if ((rc == -EPERM) && (geteuid() != 0))
++		rc = 0;
++	errno = saved_errno;
++	if (rc < 0) {
++fatal_report:
++		fatal("linux_audit_write_entry failed: %s", strerror(errno));
++	}
+ }
+ 
++static int user_login_count = 0;
++
+ /* Below is the sshd audit API code */
+ 
+ void
+ audit_connection_from(const char *host, int port)
+ {
+-}
+ 	/* not implemented */
++}
+ 
+-void
++int
+ audit_run_command(const char *command)
+ {
+-	/* not implemented */
++	if (!user_login_count++) 
++		linux_audit_user_logxxx(the_authctxt->pw->pw_uid, NULL, get_remote_name_or_ip(utmp_len, options.use_dns),
++		    NULL, "ssh", 1, AUDIT_USER_LOGIN);
++	linux_audit_user_logxxx(the_authctxt->pw->pw_uid, NULL, get_remote_name_or_ip(utmp_len, options.use_dns),
++	    NULL, "ssh", 1, AUDIT_USER_START);
++	return 0;
++}
++
++void
++audit_end_command(int handle, const char *command)
++{
++	linux_audit_user_logxxx(the_authctxt->pw->pw_uid, NULL, get_remote_name_or_ip(utmp_len, options.use_dns),
++	    NULL, "ssh", 1, AUDIT_USER_END);
++	if (user_login_count && !--user_login_count) 
++		linux_audit_user_logxxx(the_authctxt->pw->pw_uid, NULL, get_remote_name_or_ip(utmp_len, options.use_dns),
++		    NULL, "ssh", 1, AUDIT_USER_LOGOUT);
++}
++
++void
++audit_count_session_open(void)
++{
++	user_login_count++;
+ }
+ 
+ void
+ audit_session_open(struct logininfo *li)
+ {
+-	if (linux_audit_record_event(li->uid, NULL, li->hostname,
+-	    NULL, li->line, 1) == 0)
+-		fatal("linux_audit_write_entry failed: %s", strerror(errno));
++	if (!user_login_count++) 
++		linux_audit_user_logxxx(li->uid, NULL, li->hostname,
++		    NULL, li->line, 1, AUDIT_USER_LOGIN);
++	linux_audit_user_logxxx(li->uid, NULL, li->hostname,
++	    NULL, li->line, 1, AUDIT_USER_START);
+ }
+ 
+ void
+ audit_session_close(struct logininfo *li)
+ {
+-	/* not implemented */
++	linux_audit_user_logxxx(li->uid, NULL, li->hostname,
++	    NULL, li->line, 1, AUDIT_USER_END);
++	if (user_login_count && !--user_login_count) 
++		linux_audit_user_logxxx(li->uid, NULL, li->hostname,
++		    NULL, li->line, 1, AUDIT_USER_LOGOUT);
+ }
+ 
+ void
+@@ -101,21 +192,43 @@ audit_event(ssh_audit_event_t event)
+ {
+ 	switch(event) {
+ 	case SSH_AUTH_SUCCESS:
+-	case SSH_CONNECTION_CLOSE:
++		linux_audit_user_auth(-1, audit_username(), NULL,
++			get_remote_ipaddr(), "ssh", 1, event);
++		break;
++
+ 	case SSH_NOLOGIN:
+-	case SSH_LOGIN_EXCEED_MAXTRIES:
+ 	case SSH_LOGIN_ROOT_DENIED:
++		linux_audit_user_auth(-1, audit_username(), NULL,
++			get_remote_ipaddr(), "ssh", 0, event);
++		linux_audit_user_logxxx(-1, audit_username(), NULL,
++			get_remote_ipaddr(), "ssh", 0, AUDIT_USER_LOGIN);
+ 		break;
+ 
++	case SSH_LOGIN_EXCEED_MAXTRIES:
+ 	case SSH_AUTH_FAIL_NONE:
+ 	case SSH_AUTH_FAIL_PASSWD:
+ 	case SSH_AUTH_FAIL_KBDINT:
+ 	case SSH_AUTH_FAIL_PUBKEY:
+ 	case SSH_AUTH_FAIL_HOSTBASED:
+ 	case SSH_AUTH_FAIL_GSSAPI:
++		linux_audit_user_auth(-1, audit_username(), NULL,
++			get_remote_ipaddr(), "ssh", 0, event);
++		break;
++
++	case SSH_CONNECTION_CLOSE:
++		if (user_login_count) {
++			while (user_login_count--)
++				linux_audit_user_logxxx(the_authctxt->pw->pw_uid, NULL, get_remote_name_or_ip(utmp_len, options.use_dns),
++				    NULL, "ssh", 1, AUDIT_USER_END);
++			linux_audit_user_logxxx(the_authctxt->pw->pw_uid, NULL, get_remote_name_or_ip(utmp_len, options.use_dns),
++			    NULL, "ssh", 1, AUDIT_USER_LOGOUT);
++		}
++		break;
++
++	case SSH_CONNECTION_ABANDON:
+ 	case SSH_INVALID_USER:
+-		linux_audit_record_event(-1, audit_username(), NULL,
+-			get_remote_ipaddr(), "sshd", 0);
++		linux_audit_user_logxxx(-1, audit_username(), NULL,
++			get_remote_ipaddr(), "ssh", 0, AUDIT_USER_LOGIN);
+ 		break;
+ 
+ 	default:
+diff -up openssh-5.8p1/monitor.c.audit1 openssh-5.8p1/monitor.c
+--- openssh-5.8p1/monitor.c.audit1	2010-09-10 03:23:34.000000000 +0200
++++ openssh-5.8p1/monitor.c	2011-03-04 14:16:25.000000000 +0100
+@@ -177,6 +177,7 @@ int mm_answer_gss_checkmic(int, Buffer *
+ #ifdef SSH_AUDIT_EVENTS
+ int mm_answer_audit_event(int, Buffer *);
+ int mm_answer_audit_command(int, Buffer *);
++int mm_answer_audit_end_command(int, Buffer *);
+ #endif
+ 
+ static Authctxt *authctxt;
+@@ -261,6 +262,7 @@ struct mon_table mon_dispatch_postauth20
+ #ifdef SSH_AUDIT_EVENTS
+     {MONITOR_REQ_AUDIT_EVENT, MON_PERMIT, mm_answer_audit_event},
+     {MONITOR_REQ_AUDIT_COMMAND, MON_PERMIT, mm_answer_audit_command},
++    {MONITOR_REQ_AUDIT_END_COMMAND, MON_PERMIT, mm_answer_audit_end_command},
+ #endif
+     {0, 0, NULL}
+ };
+@@ -303,6 +305,7 @@ struct mon_table mon_dispatch_postauth15
+ #ifdef SSH_AUDIT_EVENTS
+     {MONITOR_REQ_AUDIT_EVENT, MON_PERMIT, mm_answer_audit_event},
+     {MONITOR_REQ_AUDIT_COMMAND, MON_PERMIT|MON_ONCE, mm_answer_audit_command},
++    {MONITOR_REQ_AUDIT_END_COMMAND, MON_PERMIT, mm_answer_audit_end_command},
+ #endif
+     {0, 0, NULL}
+ };
+@@ -1288,6 +1291,12 @@ mm_session_close(Session *s)
+ 		debug3("%s: tty %s ptyfd %d", __func__, s->tty, s->ptyfd);
+ 		session_pty_cleanup2(s);
+ 	}
++#ifdef SSH_AUDIT_EVENTS
++	if (s->command != NULL) {
++		debug3("%s: command %d", __func__, s->command_handle);
++		session_end_command2(s);
++	}
++#endif
+ 	session_unused(s->self);
+ }
+ 
+@@ -1610,11 +1619,44 @@ mm_answer_audit_command(int socket, Buff
+ {
+ 	u_int len;
+ 	char *cmd;
++	Session *s;
+ 
+ 	debug3("%s entering", __func__);
+ 	cmd = buffer_get_string(m, &len);
++
+ 	/* sanity check command, if so how? */
+-	audit_run_command(cmd);
++	s = session_new();
++	if (s == NULL)
++		fatal("%s: error allocating a session", __func__);
++	s->command = cmd;
++	s->command_handle = audit_run_command(cmd);
++
++	buffer_clear(m);
++	buffer_put_int(m, s->self);
++
++	mm_request_send(socket, MONITOR_ANS_AUDIT_COMMAND, m);
++
++	return (0);
++}
++
++int
++mm_answer_audit_end_command(int socket, Buffer *m)
++{
++	int handle;
++	u_int len;
++	char *cmd;
++	Session *s;
++
++	debug3("%s entering", __func__);
++	handle = buffer_get_int(m);
++	cmd = buffer_get_string(m, &len);
++
++	s = session_by_id(handle);
++	if (s == NULL || s->ttyfd != -1 || s->command == NULL ||
++	    strcmp(s->command, cmd) != 0)
++		fatal("%s: invalid handle", __func__);
++	mm_session_close(s);
++
+ 	xfree(cmd);
+ 	return (0);
+ }
+diff -up openssh-5.8p1/monitor.h.audit1 openssh-5.8p1/monitor.h
+--- openssh-5.8p1/monitor.h.audit1	2008-11-05 06:20:46.000000000 +0100
++++ openssh-5.8p1/monitor.h	2011-03-04 14:16:25.000000000 +0100
+@@ -60,6 +60,7 @@ enum monitor_reqtype {
+ 	MONITOR_REQ_PAM_RESPOND, MONITOR_ANS_PAM_RESPOND,
+ 	MONITOR_REQ_PAM_FREE_CTX, MONITOR_ANS_PAM_FREE_CTX,
+ 	MONITOR_REQ_AUDIT_EVENT, MONITOR_REQ_AUDIT_COMMAND,
++	MONITOR_ANS_AUDIT_COMMAND, MONITOR_REQ_AUDIT_END_COMMAND,
+ 	MONITOR_REQ_TERM,
+ 	MONITOR_REQ_JPAKE_STEP1, MONITOR_ANS_JPAKE_STEP1,
+ 	MONITOR_REQ_JPAKE_GET_PWDATA, MONITOR_ANS_JPAKE_GET_PWDATA,
+diff -up openssh-5.8p1/monitor_wrap.c.audit1 openssh-5.8p1/monitor_wrap.c
+--- openssh-5.8p1/monitor_wrap.c.audit1	2010-08-31 14:41:14.000000000 +0200
++++ openssh-5.8p1/monitor_wrap.c	2011-03-04 14:16:25.000000000 +0100
+@@ -1150,10 +1150,11 @@ mm_audit_event(ssh_audit_event_t event)
+ 	buffer_free(&m);
+ }
+ 
+-void
++int
+ mm_audit_run_command(const char *command)
+ {
+ 	Buffer m;
++	int handle;
+ 
+ 	debug3("%s entering command %s", __func__, command);
+ 
+@@ -1161,6 +1162,26 @@ mm_audit_run_command(const char *command
+ 	buffer_put_cstring(&m, command);
+ 
+ 	mm_request_send(pmonitor->m_recvfd, MONITOR_REQ_AUDIT_COMMAND, &m);
++	mm_request_receive_expect(pmonitor->m_recvfd, MONITOR_ANS_AUDIT_COMMAND, &m);
++
++	handle = buffer_get_int(&m);
++	buffer_free(&m);
++
++	return (handle);
++}
++
++void
++mm_audit_end_command(int handle, const char *command)
++{
++	Buffer m;
++
++	debug3("%s entering command %s", __func__, command);
++
++	buffer_init(&m);
++	buffer_put_int(&m, handle);
++	buffer_put_cstring(&m, command);
++
++	mm_request_send(pmonitor->m_recvfd, MONITOR_REQ_AUDIT_END_COMMAND, &m);
+ 	buffer_free(&m);
+ }
+ #endif /* SSH_AUDIT_EVENTS */
+diff -up openssh-5.8p1/monitor_wrap.h.audit1 openssh-5.8p1/monitor_wrap.h
+--- openssh-5.8p1/monitor_wrap.h.audit1	2009-03-05 14:58:22.000000000 +0100
++++ openssh-5.8p1/monitor_wrap.h	2011-03-04 14:16:25.000000000 +0100
+@@ -73,7 +73,8 @@ void mm_sshpam_free_ctx(void *);
+ #ifdef SSH_AUDIT_EVENTS
+ #include "audit.h"
+ void mm_audit_event(ssh_audit_event_t);
+-void mm_audit_run_command(const char *);
++int mm_audit_run_command(const char *);
++void mm_audit_end_command(int, const char *);
+ #endif
+ 
+ struct Session;
+diff -up openssh-5.8p1/session.c.audit1 openssh-5.8p1/session.c
+--- openssh-5.8p1/session.c.audit1	2010-12-01 02:02:59.000000000 +0100
++++ openssh-5.8p1/session.c	2011-03-04 14:16:25.000000000 +0100
+@@ -738,6 +738,14 @@ do_exec_pty(Session *s, const char *comm
+ 	/* Parent.  Close the slave side of the pseudo tty. */
+ 	close(ttyfd);
+ 
++#ifndef HAVE_OSF_SIA
++	/* do_login in the child did not affect state in this process,
++	   compensate.  From an architectural standpoint, this is extremely
++	   ugly. */
++	if (!(options.use_login && command == NULL))
++		audit_count_session_open();
++#endif
++
+ 	/* Enter interactive session. */
+ 	s->ptymaster = ptymaster;
+ 	packet_set_interactive(1, 
+@@ -809,15 +817,19 @@ do_exec(Session *s, const char *command)
+ 	}
+ 
+ #ifdef SSH_AUDIT_EVENTS
++	if (s->command != NULL || s->command_handle != -1)
++		fatal("do_exec: command already set");
+ 	if (command != NULL)
+-		PRIVSEP(audit_run_command(command));
++		s->command = xstrdup(command);
+ 	else if (s->ttyfd == -1) {
+ 		char *shell = s->pw->pw_shell;
+ 
+ 		if (shell[0] == '\0')	/* empty shell means /bin/sh */
+ 			shell =_PATH_BSHELL;
+-		PRIVSEP(audit_run_command(shell));
++		s->command = xstrdup(shell);
+ 	}
++	if (s->command != NULL)
++		s->command_handle = PRIVSEP(audit_run_command(s->command));
+ #endif
+ 	if (s->ttyfd != -1)
+ 		ret = do_exec_pty(s, command);
+@@ -1841,6 +1853,7 @@ session_unused(int id)
+ 	sessions[id].ttyfd = -1;
+ 	sessions[id].ptymaster = -1;
+ 	sessions[id].x11_chanids = NULL;
++	sessions[id].command_handle = -1;
+ 	sessions[id].next_unused = sessions_first_unused;
+ 	sessions_first_unused = id;
+ }
+@@ -1923,6 +1936,19 @@ session_open(Authctxt *authctxt, int cha
+ }
+ 
+ Session *
++session_by_id(int id)
++{
++	if (id >= 0 && id < sessions_nalloc) {
++		Session *s = &sessions[id];
++		if (s->used)
++			return s;
++	}
++	debug("session_by_id: unknown id %d", id);
++	session_dump();
++	return NULL;
++}
++
++Session *
+ session_by_tty(char *tty)
+ {
+ 	int i;
+@@ -2448,6 +2474,30 @@ session_exit_message(Session *s, int sta
+ 		chan_write_failed(c);
+ }
+ 
++#ifdef SSH_AUDIT_EVENTS
++void
++session_end_command2(Session *s)
++{
++	if (s->command != NULL) {
++		audit_end_command(s->command_handle, s->command);
++		xfree(s->command);
++		s->command = NULL;
++		s->command_handle = -1;
++	}
++}
++
++static void
++session_end_command(Session *s)
++{
++	if (s->command != NULL) {
++		PRIVSEP(audit_end_command(s->command_handle, s->command));
++		xfree(s->command);
++		s->command = NULL;
++		s->command_handle = -1;
++	}
++}
++#endif
++
+ void
+ session_close(Session *s)
+ {
+@@ -2456,6 +2506,10 @@ session_close(Session *s)
+ 	debug("session_close: session %d pid %ld", s->self, (long)s->pid);
+ 	if (s->ttyfd != -1)
+ 		session_pty_cleanup(s);
++#ifdef SSH_AUDIT_EVENTS
++	if (s->command)
++		session_end_command(s);
++#endif
+ 	if (s->term)
+ 		xfree(s->term);
+ 	if (s->display)
+@@ -2675,6 +2729,15 @@ do_authenticated2(Authctxt *authctxt)
+ 	server_loop2(authctxt);
+ }
+ 
++static void
++do_cleanup_one_session(Session *s)
++{
++	session_pty_cleanup2(s);
++#ifdef SSH_AUDIT_EVENTS
++	session_end_command2(s);
++#endif
++}
++
+ void
+ do_cleanup(Authctxt *authctxt)
+ {
+@@ -2723,5 +2786,5 @@ do_cleanup(Authctxt *authctxt)
+ 	 * or if running in monitor.
+ 	 */
+ 	if (!use_privsep || mm_is_monitor())
+-		session_destroy_all(session_pty_cleanup2);
++		session_destroy_all(do_cleanup_one_session);
+ }
+diff -up openssh-5.8p1/session.h.audit1 openssh-5.8p1/session.h
+--- openssh-5.8p1/session.h.audit1	2008-05-19 07:34:50.000000000 +0200
++++ openssh-5.8p1/session.h	2011-03-04 14:16:25.000000000 +0100
+@@ -60,6 +60,12 @@ struct Session {
+ 		char	*name;
+ 		char	*val;
+ 	} *env;
++
++	/* exec */
++#ifdef SSH_AUDIT_EVENTS
++	int	command_handle;
++	char	*command;
++#endif
+ };
+ 
+ void	 do_authenticated(Authctxt *);
+@@ -72,8 +78,10 @@ void	 session_close_by_pid(pid_t, int);
+ void	 session_close_by_channel(int, void *);
+ void	 session_destroy_all(void (*)(Session *));
+ void	 session_pty_cleanup2(Session *);
++void	 session_end_command2(Session *);
+ 
+ Session	*session_new(void);
++Session *session_by_id(int);
+ Session	*session_by_tty(char *);
+ void	 session_close(Session *);
+ void	 do_setusercontext(struct passwd *);
+diff -up openssh-5.8p1/sshd.c.audit1 openssh-5.8p1/sshd.c
+--- openssh-5.8p1/sshd.c.audit1	2011-01-11 07:20:31.000000000 +0100
++++ openssh-5.8p1/sshd.c	2011-03-04 14:16:25.000000000 +0100
+@@ -2342,7 +2342,8 @@ cleanup_exit(int i)
+ 		do_cleanup(the_authctxt);
+ #ifdef SSH_AUDIT_EVENTS
+ 	/* done after do_cleanup so it can cancel the PAM auth 'thread' */
+-	if (!use_privsep || mm_is_monitor())
++	if ((the_authctxt == NULL || !the_authctxt->authenticated) &&
++	    (!use_privsep || mm_is_monitor()))
+ 		audit_event(SSH_CONNECTION_ABANDON);
+ #endif
+ 	_exit(i);

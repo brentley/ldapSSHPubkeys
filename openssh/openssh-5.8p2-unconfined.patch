@@ -1,0 +1,15 @@
+diff -up openssh-5.8p2/openbsd-compat/port-linux.c.unconfined openssh-5.8p2/openbsd-compat/port-linux.c
+--- openssh-5.8p2/openbsd-compat/port-linux.c.unconfined	2011-07-21 12:23:53.912418908 +0200
++++ openssh-5.8p2/openbsd-compat/port-linux.c	2011-07-21 13:33:14.188545403 +0200
+@@ -491,6 +491,11 @@ ssh_selinux_change_context(const char *n
+ 		return;
+ 	}
+ 
++	if (!strncmp(cx, ":unconfined_t:", strlen(":unconfined_t:"))) {
++		debug3("%s: do not change unconfined_t", __func__);
++		return;
++	}
++
+ 	newlen = strlen(oldctx) + strlen(newname) + 1;
+ 	newctx = xmalloc(newlen);
+ 	len = cx - oldctx + 1;
