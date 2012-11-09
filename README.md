@@ -39,3 +39,4 @@ LDAP Server Setup
 * add keys to your users' accounts (see ldap-sshkeyadd in my ldap-management-tools repo)
 
 Note: This objectclass is intentionally *not* self service to avoid someone compromising an account and maliciously pushing a bogus key. I also restrict users to a single key to support key deactivation in the event of key loss.  The schema, however, does permit multiple keys on accounts.
+
