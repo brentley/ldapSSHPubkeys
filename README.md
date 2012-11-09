@@ -18,6 +18,8 @@ Dumping Puppet code here now. Format later.
       }
 
 Include this in /etc/ssh/sshd_config:
+
       AuthorizedKeysCommand /openssh-ldap/ssh-ldap-wrapper
 
-Note: The /openssh-ldap directory is necessary, because openssh refuses to traverse to /usr/libexec/openssh because /usr has more than 0700 permissions.  This is likely a bug and will almost certainly be addressed in a later release of openssh.
+Note: 
+The /openssh-ldap directory is necessary, because openssh refuses to traverse to /usr/libexec/openssh because /usr has more than 0700 permissions.  This is likely a bug and will almost certainly be addressed in a later release of openssh.
